@@ -3,14 +3,16 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional
 from database import supabase
 
-# É obrigatório ter esta exata variável 'router' definida:
 router = APIRouter(prefix="/professors", tags=["Professors"])
 
 class ProfessorCreate(BaseModel):
     full_name: str
     email: EmailStr
+    password: str
+    age: int
     phone: Optional[str] = None
     cref: Optional[str] = None
+    specialty: Optional[str] = None
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_professor(professor: ProfessorCreate):

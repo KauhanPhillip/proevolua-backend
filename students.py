@@ -1,43 +1,33 @@
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, EmailStr
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from typing import Optional
-from datetime import date
 from database import supabase
 
-router = APIRouter(prefix="/students", tags=["Students"])
+router = APIRouter()
 
 class StudentCreate(BaseModel):
-    professor_id: str
-    full_name: str
-    email: Optional[EmailStr] = None
-    phone: Optional[str] = None
-    birth_date: Optional[date] = None
-    gender: Optional[str] = None  # "M" ou "F"
-    registration: int  # Número de matrícula obrigatório e único
+    name: str
+    email: Optional[str] = None
+    age: Optional[int] = None
+    goal: Optional[str] = None
+    professor_id: str  # Aceita como str para enviar UUID ou id como texto
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post("/students")
 def create_student(student: StudentCreate):
     try:
-        data = student.model_dump()
-        
-        # Converte a data para string caso exista, para o Supabase aceitar corretamente
-        if student.birth_date:
-            data["birth_date"] = student.birth_date.isoformat()
-
-        response = supabase.table("students").insert(data).execute()
-        
-        return {
-            "message": "Aluno cadastrado com sucesso!",
-            "data": response.data
-        }
+        response = supabase.table("students").insert(student.dict()).execute()
+        return {"message": "Aluno cadastrado com sucesso!", "data": response.data}
     except Exception as e:
-        # Se tentarem registar um número de matrícula duplicado, o Supabase vai disparar um erro que apanhamos aqui
+        print("=== ERRO AO CADASTRAR ALUNO ===")
+        print(e)  # Exibe o motivo exato no terminal do Uvicorn
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.get("/{professor_id}")
-def get_students_by_professor(professor_id: str):
+@router.get("/professors/{professor_id}/students")
+def list_professor_students(professor_id: str):
     try:
         response = supabase.table("students").select("*").eq("professor_id", professor_id).execute()
         return response.data
     except Exception as e:
+        print("=== ERRO AO LISTAR ALUNOS ===")
+        print(e)  # Exibe o motivo exato no terminal do Uvicorn
         raise HTTPException(status_code=400, detail=str(e))

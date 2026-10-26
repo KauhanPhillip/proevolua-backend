@@ -1,0 +1,39 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from database import supabase
+
+router = APIRouter()
+
+class Exercise(BaseModel):
+    name: str
+    sets: int
+    reps: str
+    weight: Optional[str] = None
+
+class WorkoutCreate(BaseModel):
+    student_id: str
+    title: str
+    exercises: List[Exercise]
+
+@router.post("/workouts")
+def create_workout(workout: WorkoutCreate):
+    try:
+        response = supabase.table("workouts").insert({
+            "student_id": workout.student_id,
+            "title": workout.title,
+            "exercises": [e.dict() for e in workout.exercises]
+        }).execute()
+        return {"message": "Ficha criada com sucesso!", "data": response.data}
+    except Exception as e:
+        print("=== ERRO AO CRIAR WORKOUT ===")
+        print(e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.get("/students/{student_id}/workouts")
+def get_student_workouts(student_id: str):
+    try:
+        response = supabase.table("workouts").select("*").eq("student_id", student_id).execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
