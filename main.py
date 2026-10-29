@@ -22,9 +22,11 @@ class LoginRequest(BaseModel):
 class StudentCreate(BaseModel):
     name: str
     email: Optional[str] = None
+    phone: Optional[str] = None
     age: Optional[int] = None
     goal: Optional[str] = None
     professor_id: int
+    is_active: Optional[bool] = True
 
 class Exercise(BaseModel):
     name: str
@@ -46,12 +48,12 @@ class AssessmentCreate(BaseModel):
     weight: float
     height: Optional[float] = None
     body_fat: Optional[float] = None
-    body_fat_kg: Optional[float] = None       # Novo
-    lean_mass: Optional[float] = None         # Novo
-    skeletal_muscle: Optional[float] = None   # Novo
-    total_body_water: Optional[float] = None  # Novo
-    visceral_fat: Optional[int] = None        # Novo
-    bone_mass: Optional[float] = None         # Novo
+    body_fat_kg: Optional[float] = None      
+    lean_mass: Optional[float] = None        
+    skeletal_muscle: Optional[float] = None  
+    total_body_water: Optional[float] = None 
+    visceral_fat: Optional[int] = None       
+    bone_mass: Optional[float] = None        
     metabolic_age: Optional[int] = None
     chest: Optional[float] = None
     waist: Optional[float] = None
@@ -101,9 +103,12 @@ def create_student(student: StudentCreate):
 @app.get("/professors/{professor_id}/students")
 def list_professor_students(professor_id: int):
     try:
-        response = supabase.table("students").select("*").eq("professor_id", professor_id).execute()
+        # Busca diretamente da View otimizada que já inclui 'last_assessment_date'
+        response = supabase.table("students_with_last_assessment").select("*").eq("professor_id", professor_id).execute()
         return response.data
     except Exception as e:
+        print("=== ERRO AO LISTAR ALUNOS COM VIEW ===")
+        print(e)
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/students/{student_id}")
@@ -122,8 +127,10 @@ def update_student(student_id: str, student: StudentCreate):
         response = supabase.table("students").update({
             "name": student.name,
             "email": student.email,
+            "phone": student.phone,
             "age": student.age,
-            "goal": student.goal
+            "goal": student.goal,
+            "is_active": student.is_active
         }).eq("id", student_id).execute()
         return {"message": "Aluno atualizado com sucesso!", "data": response.data}
     except Exception as e:
