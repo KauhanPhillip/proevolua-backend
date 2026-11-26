@@ -1,6 +1,6 @@
 import os
 import secrets
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -29,7 +29,7 @@ class GoogleLoginRequest(BaseModel):
 
 class ProfessorUpdate(BaseModel):
     full_name: str
-    birth_date: Optional[str] = None  # <--- Atualizado de age para birth_date
+    birth_date: Optional[str] = None
     phone: Optional[str] = None
     cref: Optional[str] = None
     specialty: Optional[str] = None
@@ -38,9 +38,13 @@ class StudentCreate(BaseModel):
     name: str
     email: Optional[str] = None
     phone: Optional[str] = None
-    birth_date: Optional[str] = None  # <--- Atualizado de age para birth_date
+    birth_date: Optional[str] = None
     goal: Optional[str] = None
     professor_id: int
+    is_active: Optional[bool] = True
+
+class StudentStatusUpdate(BaseModel):
+    is_active: bool
 
 class Exercise(BaseModel):
     name: str
@@ -90,6 +94,27 @@ class AssessmentUpdate(BaseModel):
     arms: Optional[float] = None
     legs: Optional[float] = None
 
+def _ensure_professor_approved(professor: dict) -> None:
+    approval_status = (professor.get("approval_status") or "pending").lower()
+
+    if approval_status == "pending":
+        raise HTTPException(
+            status_code=403,
+            detail="Seu cadastro aguarda aprovação do administrador.",
+        )
+
+    if approval_status == "rejected":
+        raise HTTPException(
+            status_code=403,
+            detail="Seu cadastro não foi aprovado. Entre em contato com o administrador.",
+        )
+
+    if approval_status != "approved":
+        raise HTTPException(
+            status_code=403,
+            detail="Acesso não autorizado para esta conta.",
+        )
+
 # --- ROTA DE LOGIN ---
 @app.post("/auth/login")
 def login(data: LoginRequest):
@@ -97,10 +122,12 @@ def login(data: LoginRequest):
         response = supabase.table("professors").select("*").eq("email", data.email).execute()
         if not response.data or len(response.data) == 0:
             raise HTTPException(status_code=401, detail="E-mail ou senha incorretos")
-        
+
         professor = response.data[0]
         if professor.get("password") and professor.get("password") != data.password:
             raise HTTPException(status_code=401, detail="E-mail ou senha incorretos")
+
+        _ensure_professor_approved(professor)
 
         return {
             "message": "Login realizado com sucesso!",
@@ -145,8 +172,12 @@ def google_login(data: GoogleLoginRequest):
                 "email": raw_email.lower(),
                 "full_name": name,
                 "password": secrets.token_urlsafe(32),
+                "approval_status": "pending",
+                "approved_at": None,
             }).execute()
             professor = created.data[0]
+
+        _ensure_professor_approved(professor)
 
         return {
             "message": "Login realizado com sucesso!",
@@ -154,12 +185,14 @@ def google_login(data: GoogleLoginRequest):
             "name": professor.get("full_name", name),
             "picture": info.get("picture"),
         }
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         print("ERRO NO LOGIN COM GOOGLE:", str(e))
         raise HTTPException(status_code=400, detail=str(e))
 
 # --- ROTAS DO PERFIL DO PROFESSOR ---
-PROFESSOR_PUBLIC_FIELDS = "id,full_name,email,birth_date,phone,cref,specialty,created_at"  # <--- Atualizado de age para birth_date
+PROFESSOR_PUBLIC_FIELDS = "id,full_name,email,birth_date,phone,cref,specialty,created_at"
 
 def _parse_dt(value):
     if not value:
@@ -192,7 +225,7 @@ def update_professor(professor_id: int, professor: ProfessorUpdate):
     try:
         response = supabase.table("professors").update({
             "full_name": professor.full_name,
-            "birth_date": professor.birth_date,  # <--- Atualizado de age para birth_date
+            "birth_date": professor.birth_date,
             "phone": professor.phone,
             "cref": professor.cref,
             "specialty": professor.specialty,
@@ -288,6 +321,8 @@ def get_professor_stats(professor_id: int):
 def create_student(student: StudentCreate):
     try:
         data_to_insert = student.model_dump() if hasattr(student, 'model_dump') else student.dict()
+        if data_to_insert.get("is_active") is None:
+            data_to_insert["is_active"] = True
         response = supabase.table("students").insert(data_to_insert).execute()
         return {"message": "Aluno cadastrado com sucesso!", "data": response.data}
     except Exception as e:
@@ -314,14 +349,38 @@ def get_student(student_id: str):
 @app.put("/students/{student_id}")
 def update_student(student_id: str, student: StudentCreate):
     try:
-        response = supabase.table("students").update({
+        update_payload = {
             "name": student.name,
             "email": student.email,
             "phone": student.phone,
-            "birth_date": student.birth_date,  
-            "goal": student.goal
-        }).eq("id", student_id).execute()
+            "birth_date": student.birth_date,
+            "goal": student.goal,
+        }
+        if student.is_active is not None:
+            update_payload["is_active"] = student.is_active
+
+        response = supabase.table("students").update(update_payload).eq("id", student_id).execute()
         return {"message": "Aluno atualizado com sucesso!", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.patch("/students/{student_id}/status")
+def update_student_status(student_id: str, payload: StudentStatusUpdate):
+    try:
+        response = (
+            supabase.table("students")
+            .update({"is_active": payload.is_active})
+            .eq("id", student_id)
+            .execute()
+        )
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Aluno não encontrado")
+        return {
+            "message": "Status do aluno atualizado com sucesso!",
+            "data": response.data[0],
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
