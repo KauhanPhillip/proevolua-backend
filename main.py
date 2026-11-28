@@ -1,6 +1,6 @@
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -29,7 +29,7 @@ class GoogleLoginRequest(BaseModel):
 
 class ProfessorUpdate(BaseModel):
     full_name: str
-    birth_date: Optional[str] = None
+    age: Optional[int] = None
     phone: Optional[str] = None
     cref: Optional[str] = None
     specialty: Optional[str] = None
@@ -38,13 +38,9 @@ class StudentCreate(BaseModel):
     name: str
     email: Optional[str] = None
     phone: Optional[str] = None
-    birth_date: Optional[str] = None
+    age: Optional[int] = None
     goal: Optional[str] = None
     professor_id: int
-    is_active: Optional[bool] = True
-
-class StudentStatusUpdate(BaseModel):
-    is_active: bool
 
 class Exercise(BaseModel):
     name: str
@@ -94,26 +90,27 @@ class AssessmentUpdate(BaseModel):
     arms: Optional[float] = None
     legs: Optional[float] = None
 
-def _ensure_professor_approved(professor: dict) -> None:
-    approval_status = (professor.get("approval_status") or "pending").lower()
 
-    if approval_status == "pending":
-        raise HTTPException(
-            status_code=403,
-            detail="Seu cadastro aguarda aprovação do administrador.",
-        )
+# --- MODELOS DE MENSALIDADES ---
+class PlanCreate(BaseModel):
+    name: str
+    price: float
+    duration_days: int
+    active: bool = True
 
-    if approval_status == "rejected":
-        raise HTTPException(
-            status_code=403,
-            detail="Seu cadastro não foi aprovado. Entre em contato com o administrador.",
-        )
+class SubscriptionUpsert(BaseModel):
+    plan_id: Optional[str] = None
+    plan_name: str
+    price: float
+    duration_days: int
+    due_date: str  # AAAA-MM-DD
+    active: bool = True
 
-    if approval_status != "approved":
-        raise HTTPException(
-            status_code=403,
-            detail="Acesso não autorizado para esta conta.",
-        )
+class PaymentCreate(BaseModel):
+    amount: float
+    paid_at: Optional[str] = None  # AAAA-MM-DD (padrão: hoje)
+    method: Optional[str] = None
+    notes: Optional[str] = None
 
 # --- ROTA DE LOGIN ---
 @app.post("/auth/login")
@@ -122,12 +119,10 @@ def login(data: LoginRequest):
         response = supabase.table("professors").select("*").eq("email", data.email).execute()
         if not response.data or len(response.data) == 0:
             raise HTTPException(status_code=401, detail="E-mail ou senha incorretos")
-
+        
         professor = response.data[0]
         if professor.get("password") and professor.get("password") != data.password:
             raise HTTPException(status_code=401, detail="E-mail ou senha incorretos")
-
-        _ensure_professor_approved(professor)
 
         return {
             "message": "Login realizado com sucesso!",
@@ -142,6 +137,7 @@ def login(data: LoginRequest):
 # --- ROTA DE LOGIN COM GOOGLE ---
 @app.post("/auth/google")
 def google_login(data: GoogleLoginRequest):
+    # 1) Valida o token direto com o Google (ninguém consegue falsificar o e-mail pelo front)
     try:
         info = id_token.verify_oauth2_token(
             data.credential,
@@ -157,6 +153,7 @@ def google_login(data: GoogleLoginRequest):
     raw_email = info["email"]
     name = info.get("name") or "Professor"
 
+    # 2) Procura o professor pelo e-mail; se não existir, cria automaticamente
     try:
         response = (
             supabase.table("professors")
@@ -171,13 +168,9 @@ def google_login(data: GoogleLoginRequest):
             created = supabase.table("professors").insert({
                 "email": raw_email.lower(),
                 "full_name": name,
-                "password": secrets.token_urlsafe(32),
-                "approval_status": "pending",
-                "approved_at": None,
+                "password": secrets.token_urlsafe(32),  # senha aleatória, ninguém digita
             }).execute()
             professor = created.data[0]
-
-        _ensure_professor_approved(professor)
 
         return {
             "message": "Login realizado com sucesso!",
@@ -185,14 +178,13 @@ def google_login(data: GoogleLoginRequest):
             "name": professor.get("full_name", name),
             "picture": info.get("picture"),
         }
-    except HTTPException as http_exc:
-        raise http_exc
     except Exception as e:
         print("ERRO NO LOGIN COM GOOGLE:", str(e))
         raise HTTPException(status_code=400, detail=str(e))
 
 # --- ROTAS DO PERFIL DO PROFESSOR ---
-PROFESSOR_PUBLIC_FIELDS = "id,full_name,email,birth_date,phone,cref,specialty,created_at"
+# Nunca devolvemos a senha: só estes campos são selecionados
+PROFESSOR_PUBLIC_FIELDS = "id,full_name,email,age,phone,cref,specialty,created_at"
 
 def _parse_dt(value):
     if not value:
@@ -225,7 +217,7 @@ def update_professor(professor_id: int, professor: ProfessorUpdate):
     try:
         response = supabase.table("professors").update({
             "full_name": professor.full_name,
-            "birth_date": professor.birth_date,
+            "age": professor.age,
             "phone": professor.phone,
             "cref": professor.cref,
             "specialty": professor.specialty,
@@ -265,12 +257,14 @@ def get_professor_stats(professor_id: int):
         epoch = datetime.min.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
 
+        # Data da última avaliação de cada aluno
         last_by_student = {}
         for a in assessments:
             dt = _parse_dt(a.get("created_at"))
             if dt and dt > last_by_student.get(a["student_id"], epoch):
                 last_by_student[a["student_id"]] = dt
 
+        # Alunos nunca avaliados ou sem avaliação há 30 dias ou mais
         needs_reassessment = []
         for s in students:
             last = last_by_student.get(s["id"])
@@ -282,6 +276,7 @@ def get_professor_stats(professor_id: int):
                     "last_assessment": last.isoformat() if last else None,
                     "days": days,
                 })
+        # Nunca avaliados primeiro; depois os mais antigos
         needs_reassessment.sort(key=lambda x: (x["days"] is not None, -(x["days"] or 0)))
 
         recent_students = sorted(
@@ -320,10 +315,7 @@ def get_professor_stats(professor_id: int):
 @app.post("/students")
 def create_student(student: StudentCreate):
     try:
-        data_to_insert = student.model_dump() if hasattr(student, 'model_dump') else student.dict()
-        if data_to_insert.get("is_active") is None:
-            data_to_insert["is_active"] = True
-        response = supabase.table("students").insert(data_to_insert).execute()
+        response = supabase.table("students").insert(student.dict()).execute()
         return {"message": "Aluno cadastrado com sucesso!", "data": response.data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -349,38 +341,14 @@ def get_student(student_id: str):
 @app.put("/students/{student_id}")
 def update_student(student_id: str, student: StudentCreate):
     try:
-        update_payload = {
+        response = supabase.table("students").update({
             "name": student.name,
             "email": student.email,
             "phone": student.phone,
-            "birth_date": student.birth_date,
-            "goal": student.goal,
-        }
-        if student.is_active is not None:
-            update_payload["is_active"] = student.is_active
-
-        response = supabase.table("students").update(update_payload).eq("id", student_id).execute()
+            "age": student.age,
+            "goal": student.goal
+        }).eq("id", student_id).execute()
         return {"message": "Aluno atualizado com sucesso!", "data": response.data}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.patch("/students/{student_id}/status")
-def update_student_status(student_id: str, payload: StudentStatusUpdate):
-    try:
-        response = (
-            supabase.table("students")
-            .update({"is_active": payload.is_active})
-            .eq("id", student_id)
-            .execute()
-        )
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Aluno não encontrado")
-        return {
-            "message": "Status do aluno atualizado com sucesso!",
-            "data": response.data[0],
-        }
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -468,7 +436,189 @@ def delete_assessment(assessment_id: str):
         response = supabase.table("assessments").delete().eq("id", assessment_id).execute()
         return {"message": "Avaliação excluída com sucesso!", "data": response.data}
     except Exception as e:
-        print("ERRO DETALHADO SUPABASE (PUT):", str(e))
+        print("ERRO DETALHADO SUPABASE (DELETE):", str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- ROTAS DE MENSALIDADES ---
+def _parse_date(value, field="data"):
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail=f"{field} inválida (use AAAA-MM-DD)")
+
+# Planos
+@app.get("/professors/{professor_id}/plans")
+def list_plans(professor_id: int):
+    try:
+        response = (
+            supabase.table("plans").select("*").eq("professor_id", professor_id)
+            .order("created_at").execute()
+        )
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/professors/{professor_id}/plans")
+def create_plan(professor_id: int, plan: PlanCreate):
+    if plan.price < 0 or plan.duration_days < 1:
+        raise HTTPException(status_code=400, detail="Valor e duração inválidos")
+    try:
+        response = supabase.table("plans").insert({
+            "professor_id": professor_id,
+            "name": plan.name.strip(),
+            "price": plan.price,
+            "duration_days": plan.duration_days,
+            "active": plan.active,
+        }).execute()
+        return {"message": "Plano criado com sucesso!", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/plans/{plan_id}")
+def update_plan(plan_id: str, plan: PlanCreate):
+    if plan.price < 0 or plan.duration_days < 1:
+        raise HTTPException(status_code=400, detail="Valor e duração inválidos")
+    try:
+        response = supabase.table("plans").update({
+            "name": plan.name.strip(),
+            "price": plan.price,
+            "duration_days": plan.duration_days,
+            "active": plan.active,
+        }).eq("id", plan_id).execute()
+        return {"message": "Plano atualizado com sucesso!", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/plans/{plan_id}")
+def delete_plan(plan_id: str):
+    try:
+        response = supabase.table("plans").delete().eq("id", plan_id).execute()
+        return {"message": "Plano excluído com sucesso!", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Painel de mensalidades: assinaturas + pagamentos do professor.
+# O status (pago / a vencer / vencida) é calculado no front, com a data do navegador.
+@app.get("/professors/{professor_id}/billing")
+def get_billing(professor_id: int):
+    try:
+        students = (
+            supabase.table("students").select("id").eq("professor_id", professor_id).execute().data or []
+        )
+        ids = [s["id"] for s in students]
+        if not ids:
+            return {"subscriptions": [], "payments": []}
+
+        subscriptions = supabase.table("subscriptions").select("*").in_("student_id", ids).execute().data or []
+        payments = (
+            supabase.table("payments").select("*").in_("student_id", ids)
+            .order("paid_at", desc=True).execute().data or []
+        )
+        return {"subscriptions": subscriptions, "payments": payments}
+    except Exception as e:
+        print("ERRO NAS MENSALIDADES:", str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Assinatura do aluno (uma por aluno): cria ou atualiza
+@app.put("/students/{student_id}/subscription")
+def upsert_subscription(student_id: str, sub: SubscriptionUpsert):
+    if sub.price < 0 or sub.duration_days < 1:
+        raise HTTPException(status_code=400, detail="Valor e duração inválidos")
+    due = _parse_date(sub.due_date, "Vencimento")
+    try:
+        payload = {
+            "student_id": student_id,
+            "plan_id": sub.plan_id or None,
+            "plan_name": sub.plan_name,
+            "price": sub.price,
+            "duration_days": sub.duration_days,
+            "due_date": due.isoformat(),
+            "active": sub.active,
+        }
+        existing = supabase.table("subscriptions").select("id").eq("student_id", student_id).execute().data
+        if existing:
+            response = supabase.table("subscriptions").update(payload).eq("student_id", student_id).execute()
+        else:
+            response = supabase.table("subscriptions").insert(payload).execute()
+        return {"message": "Mensalidade salva com sucesso!", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/students/{student_id}/subscription")
+def delete_subscription(student_id: str):
+    try:
+        response = supabase.table("subscriptions").delete().eq("student_id", student_id).execute()
+        return {"message": "Mensalidade removida com sucesso!", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Pagamentos
+@app.get("/students/{student_id}/payments")
+def list_student_payments(student_id: str):
+    try:
+        response = (
+            supabase.table("payments").select("*").eq("student_id", student_id)
+            .order("paid_at", desc=True).execute()
+        )
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Registra o pagamento (valor inteiro) e avança o vencimento pela duração do plano
+@app.post("/students/{student_id}/payments")
+def create_payment(student_id: str, payment: PaymentCreate):
+    try:
+        subs = supabase.table("subscriptions").select("*").eq("student_id", student_id).execute().data
+        if not subs:
+            raise HTTPException(status_code=400, detail="Este aluno ainda não tem mensalidade cadastrada")
+        sub = subs[0]
+
+        paid_at = _parse_date(payment.paid_at, "Data do pagamento") if payment.paid_at else date.today()
+        due_before = _parse_date(sub["due_date"])
+        due_after = due_before + timedelta(days=int(sub["duration_days"]))
+
+        created = supabase.table("payments").insert({
+            "student_id": student_id,
+            "subscription_id": sub["id"],
+            "plan_name": sub.get("plan_name"),
+            "amount": payment.amount,
+            "paid_at": paid_at.isoformat(),
+            "method": payment.method,
+            "notes": payment.notes,
+            "due_before": due_before.isoformat(),
+            "due_after": due_after.isoformat(),
+        }).execute()
+
+        supabase.table("subscriptions").update({"due_date": due_after.isoformat()}).eq("id", sub["id"]).execute()
+        return {"message": "Pagamento registrado com sucesso!", "data": created.data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("ERRO AO REGISTRAR PAGAMENTO:", str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Desfaz um pagamento lançado por engano e devolve o vencimento anterior
+@app.delete("/payments/{payment_id}")
+def delete_payment(payment_id: str):
+    try:
+        found = supabase.table("payments").select("*").eq("id", payment_id).execute().data
+        if not found:
+            raise HTTPException(status_code=404, detail="Pagamento não encontrado")
+        pay = found[0]
+
+        subs = supabase.table("subscriptions").select("*").eq("student_id", pay["student_id"]).execute().data
+        if subs and pay.get("due_before") and pay.get("due_after"):
+            # só devolve o vencimento se ele ainda é o que esse pagamento gerou
+            if str(subs[0]["due_date"])[:10] == str(pay["due_after"])[:10]:
+                supabase.table("subscriptions").update(
+                    {"due_date": str(pay["due_before"])[:10]}
+                ).eq("id", subs[0]["id"]).execute()
+
+        supabase.table("payments").delete().eq("id", payment_id).execute()
+        return {"message": "Pagamento desfeito com sucesso!"}
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/")
